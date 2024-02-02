@@ -1,0 +1,389 @@
+---
+title: "project:meznet"
+author: "frankiethull"
+format: gfm
+---
+
+*project:meznet* is a codename for the repo. Computer Vision image*net*s are often stuck in a *mez*merized-self-hypnotic state of incorrectly describing images or biased towards one answer or another. *Meznet* just seemed like a cool word. Repo includes ensembling of many pre-trained Keras, Torch, & use of local LLMs as a substitute.
+
+*Keras* is a Deep Learning library with a pre-trained computer vision models. The main idea started as an ensembling approach of pre-trained models using ranking, means, and weighted averaging of many imagenets to create one final outcome. It seemed like a fast-and-easy way to combine imagenets without retraining the top layer on another dataset. 
+
+*Vixtral* is a play on words and discussed at the bottom of the examples. The example includes use of Mixtral, an LLM, for computer *vi*sion. This showcases an additional way for determining which labels are the ideal answer for a particular image. The idea here was that there are so many ways to ensemble the imagenets. There are also tons of ways to fine-tune imagenets, but that's a lot of effort. What if an LLM can assist with image labeling?
+
+setup:
+```{r}
+#| warning: false
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(keras)
+library(ggplot2)
+library(gt)
+library(fuzzyjoin)
+library(reticulate)
+options(scipen = 999)
+```
+
+#### pre-trained applications for keras
+
+scrape keras pretrained application info:
+```{r}
+# note, image size is not displayed on these tbls
+tbl <- rvest::read_html("https://keras.io/api/applications/") |>
+       rvest::html_table()
+
+# smaller models
+tbl[[1]] |> 
+  arrange(`Size (MB)`) |>
+  head(3)
+```
+
+```{r}
+# top performing below size threshold
+tbl[[1]] |>
+  filter(`Size (MB)` < 100) |>  
+  arrange(desc(`Top-5 Accuracy`)) |>
+  head(10)
+```
+
+
+load some computer vision models: 
+```{r}
+
+vision_models <- list(resnet50 = keras::application_resnet50(weights = "imagenet"),
+                      mobilev2 = keras::application_mobilenet_v2(weights = "imagenet"),
+                      efficib0 = keras::application_efficientnet_b0(weights = "imagenet"),
+                      dense121 = keras::application_densenet121(weights = "imagenet"),
+                      nasmobil = keras::application_nasnetmobile(weights = "imagenet")
+                     )
+
+model_ids <- data.frame(
+  model_name = names(vision_models),
+  id = 1:length(vision_models),
+  stringsAsFactors = FALSE
+)                      
+
+# for post modeling validation layer:
+wordnet_id <- data.table::fread("val_annotations.txt",
+                                drop = 3:6,
+                                col.names = c("image_name", "wnids"))
+
+words      <- data.table::fread("words.txt", 
+                                header = FALSE, 
+                                col.names = c("wnids", "words"))
+
+images <- list.files("images")
+
+# wordnet for each image
+validation_tbl <- wordnet_id |> 
+                  filter(image_name %in% images) |> 
+                  left_join(words)
+```
+image to processing and predictions:
+```{r}
+#| output: false
+#| 
+
+img_processing <- function(image){
+ img <- image
+  # load / sizing 
+img_path <- paste0("images/", img)
+img <- image_load(img_path, target_size = c(224,224))
+x <- image_to_array(img)
+
+# 4d tensor
+x <- array_reshape(x, c(1, dim(x)))
+x <- imagenet_preprocess_input(x)
+ return(x)
+}
+
+processed_images <- map(images, img_processing)
+
+# make predictions then decode and print them
+# map(vision_models, predict, processed_images[[1]])
+# results <- map2(rep(vision_models, each = 4), processed_images, function(model, dataset) {
+#      model$predict(dataset)
+# })
+# decoded_preds_list <- map(results, imagenet_decode_predictions, top = 20)
+
+all_vision_df <- data.frame()
+for(i in 1:length(images)){
+    processed_img <- processed_images[[i]]  
+    preds <- map(vision_models, predict, processed_img)
+    
+    decoded_preds_list <- map(preds, imagenet_decode_predictions, top = 1000)
+    
+    vision_df <- bind_rows(decoded_preds_list, .id = "id") |>
+              mutate(
+                id = as.numeric(id),
+                image_name = images[[i]]
+              )
+    
+    all_vision_df <- all_vision_df |>
+                      bind_rows(vision_df)
+}
+
+all_vision_df <- all_vision_df |>
+                  left_join(model_ids, by = "id")
+
+```
+
+
+post model validation, scoring each vision model for final stacked ensemble:
+```{r}
+
+# here we need the correct word (true label), 
+# predictions for label, for each model 
+# then solve for proper weights of each model, 
+# to minimize label error
+
+# we are going to built this weighted model stack
+# based on inverse error using a lasso regression
+validation_tbl
+
+# wide_vis <- 
+# all_vision_df |>
+#     select(-class_name) |>
+#     pivot_wider(names_from = class_description, 
+#                 values_from = score, 
+#                 values_fn = mean)
+
+# top 5,10,etc. ranking:
+# all_vision_df |> 
+#   group_by(model_name, image_name) |>
+#   arrange(desc(score)) |>
+#   slice(1:5)
+
+# dense121: ,,i SeE a WeBsItE''
+# top-10 validation loop ################################################
+word_matches <- data.frame()
+for(k in 1:length(images)){
+  
+  image_words <- validation_tbl |> 
+                filter(image_name == images[k]) |> 
+                select(words) |> 
+                pull() |>
+                strsplit(", ") |>
+                unlist()
+  
+    top_predicted_words <- all_vision_df |>
+                            filter(image_name == images[k]) |>
+                            group_by(model_name, image_name) |>
+                            arrange(desc(score)) |>
+                            slice(1:10) |>
+                            mutate(
+                              class_description = gsub("_"," ", class_description)
+                            )
+# we are going to change this to a fuzzyjoin    
+# word_matching <- top_predicted_words |>
+#                   filter(class_description %in% image_words)
+
+img_word_df <- data.frame(true_description = image_words, 
+                 stringsAsFactors = FALSE)
+
+word_matching <- top_predicted_words |>
+                    stringdist_right_join(img_word_df,
+                                          by = c("class_description" = "true_description"),
+                                          max_dist = 3)
+  
+  word_matches <- word_matches |> bind_rows(word_matching)  
+}
+
+word_matches <- word_matches |> na.omit()
+
+```
+
+# predictions for an image:
+
+top scores for an image:
+```{r}
+example_img <- "val_384.JPEG"
+
+all_vision_df |>
+  filter(image_name == example_img) |>
+  arrange(desc(score)) |> 
+  head()
+```
+display image:
+```{r}
+jpeg <- imager::load.image(paste0("images/", example_img))
+plot(jpeg)
+```
+
+# ensembling ######################################################################
+
+#### averaging predictions (soft-voting):
+simple averaging across each model
+```{r}
+all_vision_df |>
+    filter(image_name == example_img) |>
+    group_by(class_description) |>
+    summarize(
+        mean  = mean(score),
+    ) |> 
+  arrange(desc(mean)) |>
+  head()
+```
+
+#### plural hard-voting:
+taking the top votes via comparing the majority vote across the top softmax scores
+```{r}
+all_vision_df |>
+    filter(image_name == example_img) |>
+    group_by(model_name) |>
+    arrange(desc(score)) |> 
+    slice(1:10) |>
+    ungroup() |>
+    count(class_description) |>
+    arrange(desc(n)) |>
+  head()
+```
+
+
+the models think this is either a clock, ping-pong ball, or jellyfish to a human it's pretty obvious it's a jellyfish. This is why a validation dataset is useful, determining which models perform best, and determine weights for an ensemble. i.e. which model to trust for future predictions. 
+
+#### weighted stack based on validation:
+
+determine which models hit or miss then weight the predictions of each model being ensembled. A super/meta learner could be a logistic lasso category-2 model, optimize weights in an AUC loop, or weighted average on accuracy.  
+
+all words that were captured by our models are below:
+
+```{r}
+word_matches |> head()
+```
+which models had a correct label in the top10 softmax predictions:
+```{r}
+word_matches |> 
+  group_by(model_name) |> 
+  count()
+```
+
+weights based on accuracy
+```{r}
+model_weights <- word_matches |> 
+  group_by(model_name) |> 
+  count() |>
+  mutate(
+    wgt = n / nrow(word_matches)
+  )
+```
+
+#### weighted averaging predictions (weighted soft-voting):
+weighted averaging across each model
+```{r}
+all_vision_df |>
+    filter(image_name == example_img) |>
+    group_by(class_description) |>
+  left_join(model_weights, by = c('model_name')) |>
+  mutate(
+    weighted_score = score * wgt
+  ) |>
+    summarize(
+        mean  = mean(weighted_score),
+    ) |> 
+  arrange(desc(mean)) |>
+  head()
+```
+
+
+### throw it all together: 
+
+new image and scoring by model:
+```{r}
+test_img_processing <- function(image){
+ img <- image
+  # load / sizing 
+img_path <- paste0("test_images/", img)
+img <- image_load(img_path, target_size = c(224,224))
+x <- image_to_array(img)
+
+# 4d tensor
+x <- array_reshape(x, c(1, dim(x)))
+x <- imagenet_preprocess_input(x)
+ return(x)
+}
+# image processing
+brand_new_img <- "val_7671.jpeg"
+processed_new_img <- test_img_processing(brand_new_img)
+results <- map(vision_models, predict, processed_new_img)
+decoded_preds_list <- map(results, imagenet_decode_predictions, top = 1000)
+
+# results:
+test_df <- bind_rows(decoded_preds_list, .id = "id") |> 
+            mutate(id = as.numeric(id)) |> 
+            left_join(model_ids, by = "id") |>
+            left_join(model_weights, by = "model_name")
+
+# average across 1000 labels,
+simp_avg <- test_df |> 
+            group_by(class_description) |> 
+            summarize(mean = mean(score)) |>
+            arrange(desc(mean)) |>
+            head(5)
+
+# votes amongst top 10 sftmx scores of each model,
+votes <- test_df |>
+         group_by(model_name) |>
+         arrange(desc(score)) |> 
+         slice(1:10) |>
+         ungroup() |>
+         count(class_description) |>
+         arrange(desc(n)) 
+         
+# weighted based on our validation data an
+wgt_avg <- test_df |>
+            group_by(class_description) |> 
+            mutate(
+            weighted_score = score * wgt
+          ) |>
+            summarize(
+                mean  = mean(weighted_score),
+            ) |> 
+          arrange(desc(mean)) |> 
+          head(5)
+
+gt <- wgt_avg |>
+  gt() |> 
+  tab_header(title = html("top labels via weighted ensemble", 
+                          local_image(paste0("test_images/", brand_new_img))))
+
+gt |> as_raw_html()
+```
+
+
+
+**NOTE: for validation, we should use a large, diverse, image set. In this example we used about 20 images for the sake of speed and explanation.**
+
+### *Vixtral & Friends*
+
+Vixtral is an idea of using LLMs instead for imagenets for computer vision. The idea is simple, "do pre-trained LLMs have better performance as an imagenet than imagenets?" Replacing a local computer vision model with a local llm is easy to do. But at a cost of RAM, these models are much larger as well.   
+
+Mistral has quite a few 8GB RAM options, orca-mini is a 4GB RAM requirement, there are a lot of smaller models to explore too. New LLMs release by the day, the current format are GGUF files. In addition, new types of models are being released with specific fine-tuned purposes. Small Language Models are a thing too. A model that was released a month ago (Phi-2) is a small language model which could also be used for this type of task. Images and labels happen to be part of most training sets. Similar to fine-tuning, it is also possible to prune a LLM to create a smaller computer vision option, comparable in size to a pre-trained keras. Ollama, HuggingFace, gpt4all, all have various pre-trained LLMs to download. Below is example code for gpt4all as it is currently available on windows.    
+
+
+```{python}
+from gpt4all import GPT4All
+import os
+cwd = os.getcwd()
+subfolder = "gguf\\mistral"
+filename = "mistral-7b-instruct-v0.1.Q4_0.gguf"
+
+# llm model location (gguf file)
+llm_path = os.path.join(cwd, subfolder, filename)
+llm_model = GPT4All(llm_path)
+
+# separate image for testing the llm, 
+imgname  = "llm_images\\elephant.jpg"
+img_path = os.path.join(cwd, imgname)
+
+# let's see what the small llm handles computer vision:
+img_prompt = 'hello, can you describe the main object in the image provided? Here is the location: ' + img_path + ', please list your top words to describe this image'
+
+with llm_model.chat_session():
+  response = llm_model.generate(prompt=img_prompt,temp=0.4,n_batch=4)
+  # print(llm_model.current_chat_session)
+  print(response)
+```
+
+
+
